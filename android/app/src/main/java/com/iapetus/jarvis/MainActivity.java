@@ -26,8 +26,9 @@ public final class MainActivity extends Activity {
     private Switch proactive;
     private TextView status,camera,microphone,history;
     private final Handler ui=new Handler(Looper.getMainLooper());
-    private final OkHttpClient http=new OkHttpClient.Builder().connectTimeout(15,TimeUnit.SECONDS)
-        .readTimeout(90,TimeUnit.SECONDS).build();
+    private final OkHttpClient http=NetworkClients.requests();
+    private final StatusPoller cameraPoll=new StatusPoller(NetworkClients.status());
+    private final StatusPoller healthPoll=new StatusPoller(NetworkClients.status());
     private String pendingAction=JarvisService.START;
     private boolean visible=false;
     private MediaPlayer reply;
@@ -63,6 +64,7 @@ public final class MainActivity extends Activity {
         ScrollView scroll=new ScrollView(this);scroll.setFillViewport(true);LinearLayout root=vertical();root.setPadding(dp(18),dp(18),dp(18),dp(28));root.setBackgroundColor(Color.rgb(237,242,247));scroll.addView(root);setContentView(scroll);
         scroll.setOnApplyWindowInsetsListener((v,insets)->{v.setPadding(insets.getSystemWindowInsetLeft(),insets.getSystemWindowInsetTop(),insets.getSystemWindowInsetRight(),insets.getSystemWindowInsetBottom());return insets;});
         TextView title=text("JARVIS",32,Color.rgb(27,50,78));title.setTypeface(null,Typeface.BOLD);root.addView(title);
+        root.addView(text("v"+BuildConfig.VERSION_NAME,12,Color.rgb(79,97,119)));
         root.addView(text("ESP32 的眼睛 · 耳机里的助手",15,Color.rgb(79,97,119)));
         LinearLayout state=card(root,"设备状态");status=text("准备就绪后，开启离线唤醒或立即开始对话",16,Color.rgb(34,79,140));state.addView(status);
         camera=text("摄像头状态待检查",14,Color.DKGRAY);state.addView(camera);microphone=text("蓝牙耳机将在开启语音时选择",14,Color.DKGRAY);state.addView(microphone);
@@ -77,7 +79,13 @@ public final class MainActivity extends Activity {
         pairCode=field(connection,"一次性配对码（首次使用，可替代手填访问密钥）","",true);
         button(connection,"使用配对码连接",this::pairServer);
         proactive=new Switch(this);proactive.setText("持续观察：无需每轮唤醒，允许主动提醒");proactive.setChecked(c.proactive);proactive.setPadding(0,dp(8),0,dp(8));connection.addView(proactive);
-        button(connection,"保存并检查连接",()->{if(saveConfig()){stopService(new Intent(this,JarvisService.class));checkCamera();}});
+        button(connection,"保存并检查连接",()->{if(saveConfig()){stopService(new Intent(this,JarvisService.class));cameraPoll.cancel();checkCamera();}});
+        button(connection,"检查服务器网络",this::checkHealth);
+        button(connection,"用浏览器检查服务器",()->{
+            HttpUrl u=HttpUrl.parse(server.getText().toString().trim());
+            if(u==null||(!u.isHttps()&&!Config.privateHost(u.host()))||!u.username().isEmpty()||!u.password().isEmpty()||u.query()!=null||u.fragment()!=null){toast("请填写有效的服务器 HTTPS 地址");return;}
+            startActivity(new Intent(Intent.ACTION_VIEW,Uri.parse(u.toString().replaceAll("/+$","")+"/health")));
+        });
         button(connection,"导入连接配置 JSON",()->{Intent i=new Intent(Intent.ACTION_OPEN_DOCUMENT).setType("application/json").addCategory(Intent.CATEGORY_OPENABLE);startActivityForResult(i,20);});
         connection.addView(text("持续观察开启后，点击“开启”或“立即开始”进入会话。首次使用需要麦克风和附近设备权限。",13,Color.DKGRAY));
 
@@ -129,14 +137,42 @@ public final class MainActivity extends Activity {
     }
     @Override public void onRequestPermissionsResult(int code,String[] p,int[] r){super.onRequestPermissionsResult(code,p,r);if(code==10)launchVoice();}
 
+    private String networkFailure(IOException e){
+        if(e instanceof java.net.UnknownHostException)return "域名解析失败，请检查手机网络或私人 DNS 设置";
+        if(e instanceof javax.net.ssl.SSLException)return "HTTPS 连接失败，请检查手机时间及网络连接";
+        if(e instanceof java.net.SocketTimeoutException||e instanceof java.io.InterruptedIOException)
+            return "连接服务器超时；请点“检查服务器网络”，并检查本应用的移动数据权限";
+        return "连接中断（"+e.getClass().getSimpleName()+"），请点“检查服务器网络”";
+    }
+    private boolean sameConnection(Config c){Config now=form();return c.server.equals(now.server)&&c.token.equals(now.token)&&c.session.equals(now.session);}
+    private void cameraMessage(Config c,String message){ui.post(()->{if(visible&&sameConnection(c))camera.setText(message);});}
+    private void checkHealth(){
+        Config c=form();try{c.validateServer();}catch(Exception e){toast(e.getMessage());return;}
+        status.setText("正在检查服务器网络，最多等待约 12 秒…");
+        healthPoll.cancel();healthPoll.start(new Request.Builder().url(c.server+"/health").build(),new Callback(){
+            public void onFailure(Call call,IOException e){ui.post(()->{if(visible&&sameConnection(c))status.setText(networkFailure(e));});}
+            public void onResponse(Call call,Response response)throws IOException{try(Response r=response){
+                String result;
+                try{JSONObject j=new JSONObject(r.body().string());result=r.isSuccessful()&&j.optBoolean("ready")?"网络连接正常 · 模型已就绪。若仍无法对话，请检查访问密钥或结束其他会话。":"服务器返回 HTTP "+r.code()+"，请确认地址";}
+                catch(IOException e){result=networkFailure(e);}
+                catch(Exception e){result="地址可以访问，但返回内容不是 Jarvis 服务，请确认完整地址";}
+                final String message=result;ui.post(()->{if(visible&&sameConnection(c))status.setText(message);});
+            }}
+        });
+    }
     private void checkCamera(){
         Config c=form();try{c.validate();}catch(Exception ignored){return;}
-        http.newCall(c.request("/v1/status/"+c.session).build()).enqueue(new Callback(){
-            public void onFailure(Call call,IOException e){ui.post(()->camera.setText("服务器连接失败："+e.getMessage()));}
+        cameraPoll.start(c.request("/v1/status/"+c.session).build(),new Callback(){
+            public void onFailure(Call call,IOException e){cameraMessage(c,networkFailure(e));}
             public void onResponse(Call call,Response response)throws IOException{try(Response r=response){
-                if(!r.isSuccessful()){ui.post(()->camera.setText("服务器 HTTP "+r.code()+"，请检查地址和访问密钥"));return;}
-                try{JSONObject s=new JSONObject(r.body().string());ui.post(()->camera.setText(s.optBoolean("camera_online")?"摄像头在线 · 已收到 "+s.optInt("sequence")+" 帧":"服务器在线 · 等待同一会话的摄像头画面"));}
-                catch(Exception e){ui.post(()->camera.setText("服务器返回格式不正确"));}
+                if(!r.isSuccessful()){cameraMessage(c,r.code()==401?"已连到服务器 · 访问密钥无效，请重新导入连接 JSON":"服务器 HTTP "+r.code()+"，请检查地址");return;}
+                try{JSONObject s=new JSONObject(r.body().string());String message;
+                    if(s.optBoolean("camera_online"))message="摄像头在线 · 已收到 "+s.optInt("sequence")+" 帧";
+                    else if(s.optInt("sequence")>0)message="服务器在线 · 摄像头已断流，上次画面约 "+Math.round(s.optDouble("frame_age_seconds"))+" 秒前";
+                    else message="服务器在线 · 等待同一会话的摄像头画面";
+                    cameraMessage(c,message);}
+                catch(IOException e){cameraMessage(c,networkFailure(e));}
+                catch(Exception e){cameraMessage(c,"服务器返回格式不正确");}
             }}
         });
     }
@@ -147,7 +183,7 @@ public final class MainActivity extends Activity {
         try{
             JSONObject body=new JSONObject().put("session",c.session).put("question",q);
             http.newCall(c.request("/v1/ask").post(RequestBody.create(body.toString(),MediaType.get("application/json"))).build()).enqueue(new Callback(){
-                public void onFailure(Call call,IOException e){ui.post(()->status.setText("提问失败："+e.getMessage()));}
+                public void onFailure(Call call,IOException e){ui.post(()->status.setText("提问失败："+networkFailure(e)));}
                 public void onResponse(Call call,Response response)throws IOException{try(Response r=response){
                     if(!r.isSuccessful()){ui.post(()->status.setText(r.code()==409?"请先结束正在运行的语音会话，再发送文字问题":"模型请求失败 HTTP "+r.code()));return;}
                     try{JSONObject o=new JSONObject(r.body().string());byte[] wav=android.util.Base64.decode(o.getString("wav"),android.util.Base64.DEFAULT);
@@ -204,6 +240,6 @@ public final class MainActivity extends Activity {
         }
     }
     @Override protected void onStart(){super.onStart();visible=true;IntentFilter f=new IntentFilter(JarvisService.EVENT);androidx.core.content.ContextCompat.registerReceiver(this,events,f,androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED);ui.post(poll);}
-    @Override protected void onStop(){visible=false;ui.removeCallbacks(poll);unregisterReceiver(events);super.onStop();}
+    @Override protected void onStop(){visible=false;ui.removeCallbacks(poll);cameraPoll.cancel();healthPoll.cancel();unregisterReceiver(events);super.onStop();}
     @Override protected void onDestroy(){if(reply!=null){reply.release();reply=null;}super.onDestroy();}
 }

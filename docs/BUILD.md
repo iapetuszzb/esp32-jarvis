@@ -21,6 +21,8 @@ cd android
 
 未设置签名环境变量时 release APK 为未签名，不可直接当作正式下载包。CI 只产出 debug APK；它和 Release 签名不同，不能覆盖升级官方安装包。保护并备份私钥，后续版本升级必须使用同一个签名。
 
+Android 单独发布时，在仓库根目录运行 `python tools/prepare_release.py --android-only --out artifacts/release-v0.1.1`。脚本从构建输出元数据读取实际版本，收集 APK、第三方许可与 SHA256 校验清单；独立输出目录可避免混入旧版固件资产。
+
 ## ESP32
 
 ```sh

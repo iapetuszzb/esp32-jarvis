@@ -19,8 +19,7 @@ public final class JarvisService extends Service {
     public static final String EVENT="com.iapetus.jarvis.EVENT";
     public static final String START="start", MANUAL="manual", STOP="stop", SLEEP="sleep";
     private final Handler main=new Handler(Looper.getMainLooper());
-    private final OkHttpClient http=new OkHttpClient.Builder().connectTimeout(15,TimeUnit.SECONDS)
-        .readTimeout(0,TimeUnit.SECONDS).pingInterval(15,TimeUnit.SECONDS).build();
+    private final OkHttpClient http=NetworkClients.live();
     private Config config;
     private volatile boolean running, ready, awake, socketReady, pendingManual;
     private volatile long lastVoiceAt, lastAck=-1;

@@ -2,14 +2,14 @@
 
 ESP32-S3 + OV5640 拍摄画面，手机热点提供网络，云端 MiniCPM-o 4.5 同时理解画面和声音，Android App 将回答送到蓝牙耳机，并在本地监听 **Hey Jarvis**。
 
-**当前为 v0.1.0 原型版。** 已构建正式签名 APK 和 ESP32 合并固件，并在租用的 NVIDIA L40S 上完成公网 HTTPS / WebSocket 的图像、中文语音、有声回复测试。开发板、OPPO 手机及 Enco R4 尚未连接本工程实测，实物配网、摄像头方向、耳机麦克风路由和锁屏续航需要联调。模型回答不能作为驾驶、过马路或其他安全判断依据。
+**当前 Android 为 v0.1.1 原型版，ESP32 固件为 v0.1.0。** 已在租用的 NVIDIA L40S 上完成公网 HTTPS / WebSocket 的图像、中文语音、有声回复测试，开发板也已实际烧录并上传过 5 帧；随后出现 TLS 连接重置，持续上传仍需联调。用户手机截图显示已选择 Enco R4，但耳机实际收音、播报与锁屏续航尚未验收。v0.1.1 修复慢网络下状态请求积压，并增加 App 内网络检查；仍需在 OPPO 手机上确认超时是否解决。模型回答不能作为驾驶、过马路或其他安全判断依据。
 
 ## 下载与上手
 
-- [安卓安装包 jarvis-android-v0.1.0.apk](https://github.com/iapetuszzb/esp32-jarvis/releases/download/v0.1.0/jarvis-android-v0.1.0.apk)
+- [安卓安装包 jarvis-android-v0.1.1.apk](https://github.com/iapetuszzb/esp32-jarvis/releases/download/v0.1.1/jarvis-android-v0.1.1.apk)
 - [ESP32 固件与 Windows 烧录脚本](https://github.com/iapetuszzb/esp32-jarvis/releases/download/v0.1.0/jarvis-esp32s3-firmware.zip)
 - [合并固件，烧录地址 0x0](https://github.com/iapetuszzb/esp32-jarvis/releases/download/v0.1.0/jarvis-esp32s3-merged.bin)
-- [发布页与 SHA256SUMS.txt](https://github.com/iapetuszzb/esp32-jarvis/releases/tag/v0.1.0)
+- [Android 发布页与 SHA256SUMS.txt](https://github.com/iapetuszzb/esp32-jarvis/releases/tag/v0.1.1) · [固件发布页](https://github.com/iapetuszzb/esp32-jarvis/releases/tag/v0.1.0)
 - [逐步安装指南](docs/GETTING_STARTED.md) · [服务端部署](docs/DEPLOY.md) · [协议与系统设计](docs/ARCHITECTURE.md) · [构建方法](docs/BUILD.md) · [验证记录](docs/VALIDATION.md)
 
 APK 支持 Android 8.0+，包含离线唤醒模型，安装后首次启动需解压模型。推荐先在 OPPO 手机前台验证，再开启后台权限。连接密钥、配对码、热点密码和 APK 签名私钥均不随源码发布；当前部署的持有人通过私下提供的连接 JSON 导入。
@@ -42,7 +42,7 @@ flowchart LR
 
 ## 硬件配置
 
-固件依据用户开发板原始示例中的 `CAMERA_MODEL_ESP32S3_EYE` 配置，Flash 8 MB、OPI PSRAM、XCLK 15 MHz。不要把板型名字当成所有 ESP32-S3 的统一接线。
+固件依据用户开发板原始示例中的 `CAMERA_MODEL_ESP32S3_EYE` 配置，使用 8 MB Flash 分区布局、OPI PSRAM、XCLK 15 MHz。实际连接板已读出 16 MB Flash 和 8 MB PSRAM，当前分区只使用 Flash 的前 8 MB。不要把板型名字当成所有 ESP32-S3 的统一接线。
 
 | 信号 | GPIO | 信号 | GPIO |
 |---|---:|---|---:|
