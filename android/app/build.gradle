@@ -1,0 +1,49 @@
+plugins { id 'com.android.application' }
+
+android {
+    namespace 'com.iapetus.jarvis'
+    compileSdk 35
+    defaultConfig {
+        applicationId 'com.iapetus.jarvis'
+        minSdk 26
+        targetSdk 35
+        versionCode 1
+        versionName '0.1.0'
+        ndk { abiFilters 'arm64-v8a', 'armeabi-v7a', 'x86_64' }
+        buildConfigField 'String', 'DEFAULT_SERVER', '"' + (System.getenv('JARVIS_DEFAULT_SERVER') ?: '') + '"'
+    }
+    buildFeatures { buildConfig true }
+    signingConfigs {
+        release {
+            if (System.getenv('JARVIS_KEYSTORE')) {
+                storeFile file(System.getenv('JARVIS_KEYSTORE'))
+                storePassword System.getenv('JARVIS_STORE_PASSWORD')
+                keyAlias 'jarvis'
+                keyPassword System.getenv('JARVIS_STORE_PASSWORD')
+            }
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            if (System.getenv('JARVIS_KEYSTORE')) signingConfig signingConfigs.release
+        }
+    }
+    compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+    packaging { resources.excludes += ['META-INF/AL2.0', 'META-INF/LGPL2.1'] }
+    sourceSets.main.assets.srcDir(layout.buildDirectory.dir('generated/notices'))
+}
+
+tasks.register('copyThirdPartyNotices', Copy) {
+    from(rootProject.file('../licenses')) { into 'licenses' }
+    from(rootProject.file('../THIRD_PARTY_NOTICES.md'))
+    into(layout.buildDirectory.dir('generated/notices'))
+}
+tasks.named('preBuild').configure { dependsOn('copyThirdPartyNotices') }
+dependencies {
+    implementation 'androidx.core:core:1.13.1'
+    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+    implementation 'com.alphacephei:vosk-android:0.3.47@aar'
+    implementation 'net.java.dev.jna:jna:5.13.0@aar'
+    testImplementation 'junit:junit:4.13.2'
+}

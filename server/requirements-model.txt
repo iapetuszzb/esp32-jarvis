@@ -1,0 +1,6 @@
+# Python 3.10 tested. Install torch 2.7.1 CUDA 12.6 separately (see docs/DEPLOY.md).
+transformers==4.51.0
+minicpmo-utils==1.0.5
+librosa==0.11.0
+soundfile==0.12.1
+accelerate==1.12.0
