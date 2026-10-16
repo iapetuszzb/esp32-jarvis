@@ -12,7 +12,6 @@ from pathlib import Path
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass
 from functools import partial
 
 from dotenv import load_dotenv
@@ -21,19 +20,13 @@ from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field
 
 from .backend import MiniCPMBackend, MockBackend
+from .frames import FrameStore
 
 load_dotenv()
 log = logging.getLogger('jarvis')
 SESSION = re.compile(r'^[a-zA-Z0-9_-]{1,48}$')
 MAX_JPEG = 1024 * 1024
 Image.MAX_IMAGE_PIXELS = 16_777_216
-
-
-@dataclass
-class Frame:
-    image: Image.Image
-    received: float
-    sequence: int
 
 
 def valid_session(value):
@@ -48,9 +41,9 @@ def create_app(backend=None, token=None):
         raise RuntimeError('Set JARVIS_TOKEN to a random secret of at least 24 characters')
     model = backend or (MockBackend() if os.getenv('JARVIS_MOCK') == '1' else MiniCPMBackend())
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='jarvis-gpu')
-    frames = {}
     gpu = asyncio.Lock()
     frame_ttl = float(os.getenv('JARVIS_FRAME_TTL', '4'))
+    frames = FrameStore(ttl=frame_ttl)
     pair_code = os.getenv('JARVIS_PAIR_CODE', '')
     pair_until = time.monotonic() + float(os.getenv('JARVIS_PAIR_TTL', '86400'))
     pair_attempts = deque()
@@ -66,12 +59,20 @@ def create_app(backend=None, token=None):
         await inference(model.load)
         app.state.ready = True
         log.info('Model ready: %s', model.name)
+        async def expire_frames():
+            while True:
+                await asyncio.sleep(0.25)
+                frames.expire()
+        sweeper = asyncio.create_task(expire_frames())
         try:
             yield
         finally:
+            sweeper.cancel()
+            with suppress(asyncio.CancelledError): await sweeper
             executor.shutdown(wait=True, cancel_futures=True)
+            frames.close()
 
-    app = FastAPI(title='ESP32 Jarvis', version='0.1.0', lifespan=lifespan,
+    app = FastAPI(title='ESP32 Jarvis', version='0.2.0', lifespan=lifespan,
                   docs_url=None, redoc_url=None, openapi_url=None)
 
     def authorized(header):
@@ -82,9 +83,7 @@ def create_app(backend=None, token=None):
             raise HTTPException(401, 'Invalid access token')
 
     def latest(session):
-        f = frames.get(session)
-        age = time.monotonic() - f.received if f else None
-        return (f.image.copy() if f and age <= frame_ttl else None), age, f
+        return frames.latest(session)
 
     @app.get('/health')
     async def health():
@@ -119,6 +118,17 @@ def create_app(backend=None, token=None):
             data.extend(chunk)
             if len(data) > MAX_JPEG:
                 raise HTTPException(413, 'JPEG exceeds 1 MiB')
+        # Relay supplies capture wall time, so delayed uploads do not become fresh again.
+        age = 0
+        stamp = request.headers.get('x-frame-captured-at-ms')
+        if stamp is not None:
+            try:
+                age = time.time() - int(stamp) / 1000
+                if age < -5 or age > frame_ttl:
+                    raise ValueError()
+                age = max(0, age)
+            except (ValueError, OverflowError):
+                raise HTTPException(408, 'Frame expired or device clock incorrect')
         try:
             with Image.open(io.BytesIO(data)) as im:
                 if im.format != 'JPEG' or im.width > 4096 or im.height > 4096:
@@ -127,22 +137,17 @@ def create_app(backend=None, token=None):
                 image = im.convert('RGB')
         except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError):
             raise HTTPException(400, 'Invalid JPEG')
-        now = time.monotonic()
-        for key in list(frames):
-            if now - frames[key].received > 120:
-                frames.pop(key)
-        if session not in frames and len(frames) >= 32:
+        try:
+            sequence = frames.put(session, image, age)
+        except OverflowError:
             raise HTTPException(429, 'Too many camera sessions')
-        previous = frames.get(session)
-        sequence = previous.sequence + 1 if previous else 1
-        frames[session] = Frame(image, now, sequence)
         return {'ok': True, 'sequence': sequence}
 
     @app.get('/v1/status/{session}')
     async def status(session: str, request: Request):
         auth(request); valid_session(session)
-        image, age, f = latest(session)
-        return {'camera_online': image is not None, 'frame_age_seconds': age,
+        _, age, f = frames.latest(session, copy=False)
+        return {'camera_online': f is not None and f.image is not None, 'frame_age_seconds': age,
                 'sequence': f.sequence if f else 0, 'busy': gpu.locked(), 'model': model.name}
 
     class Ask(BaseModel):
@@ -156,6 +161,7 @@ def create_app(backend=None, token=None):
             await asyncio.wait_for(gpu.acquire(), 0.1)
         except asyncio.TimeoutError:
             raise HTTPException(409, '语音会话正在运行，请先结束会话')
+        image = None
         try:
             image, age, _ = latest(body.session)
             # Shield GPU work: an HTTP disconnect must not release the lease early.
@@ -170,6 +176,7 @@ def create_app(backend=None, token=None):
             log.exception('Text inference failed')
             raise HTTPException(500, '模型推理失败，请检查服务器日志')
         finally:
+            if image is not None: image.close()
             gpu.release()
 
     @app.websocket('/v1/live')
@@ -243,12 +250,15 @@ def create_app(backend=None, token=None):
                     break
                 seq, pcm, received = item
                 image, age, _ = latest(session)
-                work = asyncio.create_task(inference(model.push, pcm, image))
                 try:
-                    result = await asyncio.shield(work)
-                except asyncio.CancelledError:
-                    await work
-                    raise
+                    work = asyncio.create_task(inference(model.push, pcm, image))
+                    try:
+                        result = await asyncio.shield(work)
+                    except asyncio.CancelledError:
+                        await work
+                        raise
+                finally:
+                    if image is not None: image.close()
                 await send({'type': 'output', 'seq': seq, 'text': result['text'],
                     'listen': result['listen'], 'end_of_turn': result['end_of_turn'],
                     'pcm': base64.b64encode(result['audio']).decode(), 'sample_rate': 24000,

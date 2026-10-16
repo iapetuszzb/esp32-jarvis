@@ -9,10 +9,13 @@
 #include <time.h>
 #include "camera_pins.h"
 #include "root_ca.h"
+#include "camera_udp.h"
 
 Preferences prefs;
 WebServer portal(80);
 String wifiSsid, wifiPassword, serverUrl, accessToken, sessionId, setupCode;
+String transportMode="udp";
+CameraUdp cameraUdp;
 bool cameraReady = false, portalOpen = false, connectedOnce = false;
 bool automaticPortalOpened = false;
 WiFiClient plainUplink;
@@ -28,15 +31,16 @@ constexpr uint32_t SETUP_WINDOW_MS = 10 * 60 * 1000;
 const char SETUP_HTML[] PROGMEM = R"HTML(<!doctype html><html lang="zh-CN"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Jarvis 摄像头配网</title>
 <style>body{font:16px/1.7 sans-serif;max-width:600px;margin:24px auto;padding:16px;color:#172d42}input,button{box-sizing:border-box;width:100%;padding:12px;margin:6px 0 14px;font-size:16px}button{background:#224f8c;color:white;border:0;border-radius:8px}small{color:#526579}</style>
-<h1>Jarvis 摄像头</h1><p>保存手机热点和服务器配置。随后打开手机的 2.4 GHz 热点，摄像头会直接上传画面。</p>
+<h1>Jarvis 摄像头</h1><p>保存手机热点和服务器配置。UDP 模式经手机中转，HTTPS 模式直接上传。</p>
 <form method="post" action="/configure"><input type="hidden" name="setup_code" id="code">
 <label>手机热点名称<input name="ssid" id="ssid" maxlength="32" required></label>
 <label>热点密码<input name="wifi_password" type="password" minlength="8" maxlength="63" required></label>
 <label>服务器地址<input name="server" id="server" placeholder="https://your-server.example" required></label>
 <label>访问密钥<input name="token" type="password" minlength="24" maxlength="256" required></label>
 <label>设备会话 ID<input name="session" id="session" value="jarvis" pattern="[A-Za-z0-9_-]{1,48}" required></label>
+<label>传输方式<select name="transport" id="transport"><option value="udp">UDP 发给手机中转（推荐，需新版 App 开启中转）</option><option value="https">HTTPS 直接上传服务器</option></select></label>
 <button>保存并连接</button></form><small>会话 ID 必须与安卓 App 相同。按住板上 BOOT 约 3 秒可重新打开配网页面，不会清空已有配置。</small>
-<script>fetch('/setup-info').then(r=>r.json()).then(c=>{document.getElementById('code').value=c.setup_code;for(const k of ['ssid','server','session'])if(c[k])document.getElementById(k).value=c[k]});</script></html>)HTML";
+<script>fetch('/setup-info').then(r=>r.json()).then(c=>{document.getElementById('code').value=c.setup_code;for(const k of ['ssid','server','session','transport'])if(c[k])document.getElementById(k).value=c[k]});</script></html>)HTML";
 
 bool validSession(const String &s) {
   if (s.isEmpty() || s.length() > 48) return false;
@@ -86,21 +90,25 @@ void initPortal() {
     d["setup_code"]=setupCode;d["ssid"]=wifiSsid;d["server"]=serverUrl;d["session"]=sessionId;
     d["camera_ready"]=cameraReady;d["wifi_connected"]=(WiFi.status()==WL_CONNECTED);
     d["last_http_status"]=lastHttpStatus;
+    d["transport"]=transportMode;
     String s;serializeJson(d,s);portal.sendHeader("Cache-Control","no-store");portal.send(200,"application/json",s);
   });
   portal.on("/configure",HTTP_POST,[]{
     if(!portalOpen || portal.arg("setup_code")!=setupCode){portal.send(403,"text/plain","Reopen setup page");return;}
     String ssid=portal.arg("ssid"), pass=portal.arg("wifi_password"), url=portal.arg("server"),
-      token=portal.arg("token"), session=portal.arg("session");
+      token=portal.arg("token"), session=portal.arg("session"), mode=portal.arg("transport");
+    if(mode.isEmpty())mode="https"; // old APK provisioning remains compatible
     url.trim();while(url.endsWith("/"))url.remove(url.length()-1);
     if(ssid.isEmpty()||ssid.length()>32||pass.length()<8||pass.length()>63||!validServer(url)||
-        token.length()<24||token.length()>256||!validSession(session)){
+        token.length()<24||token.length()>256||!validSession(session)||(mode!="udp"&&mode!="https")){
       portal.send(400,"text/plain; charset=utf-8","配置无效：检查热点名称、密码、HTTPS 地址、访问密钥和会话 ID");return;
     }
     prefs.putString("ssid",ssid);prefs.putString("wifi_pass",pass);prefs.putString("server",url);
     prefs.putString("token",token);prefs.putString("session",session);
+    prefs.putString("transport",mode);transportMode=mode;
+    cameraUdp.reset();uplink.end();uplinkUrl="";
     wifiSsid=ssid;wifiPassword=pass;serverUrl=url;accessToken=token;sessionId=session;
-    portal.send(200,"text/html; charset=utf-8","<meta charset='utf-8'><h2>配置已保存</h2><p>请离开摄像头 Wi-Fi，打开刚填写的手机热点（2.4 GHz）。设备会自动连接并上传；安卓 App 可查看画面连接状态。</p>");
+    portal.send(200,"text/html; charset=utf-8","<meta charset='utf-8'><h2>配置已保存</h2><p>请离开摄像头 Wi-Fi，打开刚填写的手机热点（2.4 GHz）。UDP 模式还需在新版 App 开启摄像头 UDP 中转。</p>");
     connectWifi();
   });
   portal.begin();
@@ -127,9 +135,17 @@ bool initCamera() {
 
 void uploadFrame() {
   if(!cameraReady || serverUrl.isEmpty() || WiFi.status()!=WL_CONNECTED)return;
-  if(serverUrl.startsWith("https://") && time(nullptr)<1700000000){Serial.println("Waiting for NTP before TLS");return;}
+  if(time(nullptr)<1700000000){Serial.println("Waiting for NTP (TLS / UDP freshness)");return;}
   camera_fb_t *fb=esp_camera_fb_get();
   if(!fb){Serial.println("Camera capture failed");return;}
+  // Every exit after acquisition returns the buffer, including encryption/network failures.
+  struct FrameGuard {camera_fb_t *frame;~FrameGuard(){esp_camera_fb_return(frame);}} guard{fb};
+  if(transportMode=="udp"){
+    uint32_t started=millis();bool sent=cameraUdp.send(fb,accessToken,sessionId);uploadSequence++;
+    if(!sent||uploadSequence%30==0)Serial.printf("%s frame=%u local_send=%s bytes=%u ms=%u RSSI=%d heap=%u largest=%u\n",
+      cameraUdp.lastTransport(),uploadSequence,sent?"ok":"drop",(unsigned)fb->len,millis()-started,WiFi.RSSI(),ESP.getFreeHeap(),ESP.getMaxAllocHeap());
+    retryInterval=FRAME_INTERVAL_MS;return;
+  }
   String url=serverUrl+"/v1/frame/"+sessionId;
   bool ok=true;
   if(uplinkUrl!=url){
@@ -145,18 +161,22 @@ void uploadFrame() {
     if(lastHttpStatus>0)uplink.getString(); // drain small JSON response so the TLS connection can be reused
     if(lastHttpStatus!=200)Serial.printf("Frame upload status=%d bytes=%u\n",lastHttpStatus,(unsigned)fb->len);
     else if(uploadSequence%30==0)Serial.printf("Uploaded %u frames, free heap=%u\n",uploadSequence,ESP.getFreeHeap());
-    if(lastHttpStatus!=200){retryInterval=min((uint32_t)16000,retryInterval*2);uplink.end();uplinkUrl="";}
+    if(lastHttpStatus!=200){retryInterval=min((uint32_t)4000,retryInterval*2);uplink.end();uplinkUrl="";}
     else retryInterval=FRAME_INTERVAL_MS;
   }
-  esp_camera_fb_return(fb);
 }
 
 void setup() {
   Serial.begin(115200);delay(700);pinMode(0,INPUT_PULLUP);
-  Serial.printf("Jarvis Camera 0.1.0 | flash=%u PSRAM=%u\n",ESP.getFlashChipSize(),ESP.getPsramSize());
+  Serial.printf("Jarvis Camera 0.2.0 | flash=%u PSRAM=%u\n",ESP.getFlashChipSize(),ESP.getPsramSize());
   prefs.begin("jarvis",false);
   wifiSsid=prefs.getString("ssid","");wifiPassword=prefs.getString("wifi_pass","");
   serverUrl=prefs.getString("server","");accessToken=prefs.getString("token","");sessionId=prefs.getString("session","jarvis");
+  transportMode=prefs.getString("transport","udp");
+  Serial.printf("Camera transport: %s (UDP targets hotspot gateway port 19421)\n",transportMode.c_str());
+  // Reserve DMA-capable Wi-Fi buffers up front instead of allocating every TX
+  // dynamically while the PSRAM camera is running (Arduino's default).
+  WiFi.useStaticBuffers(true);
   cameraReady=initCamera();WiFi.mode(WIFI_STA);WiFi.setSleep(false);WiFi.setAutoReconnect(true);
   initPortal();configTime(0,0,"ntp.aliyun.com","pool.ntp.org","time.cloudflare.com");
   if(wifiSsid.isEmpty())startPortal();else connectWifi();
@@ -174,6 +194,7 @@ void loop() {
     if(!connectedOnce){connectedOnce=true;Serial.printf("Hotspot connected: %s\n",WiFi.localIP().toString().c_str());}
     if(millis()-lastUpload>=retryInterval){lastUpload=millis();uploadFrame();}
   }else{
+    if(connectedOnce){cameraUdp.reset();uplink.end();uplinkUrl="";}
     connectedOnce=false;
     if(!disconnectedSince)disconnectedSince=millis();
     if(!portalOpen && !automaticPortalOpened && millis()-disconnectedSince>45000)startPortal();

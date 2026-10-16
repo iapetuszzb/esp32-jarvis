@@ -2,14 +2,14 @@
 
 ESP32-S3 + OV5640 拍摄画面，手机热点提供网络，云端 MiniCPM-o 4.5 同时理解画面和声音，Android App 将回答送到蓝牙耳机，并在本地监听 **Hey Jarvis**。
 
-**当前 Android 为 v0.1.1 原型版，ESP32 固件为 v0.1.0。** 已在租用的 NVIDIA L40S 上完成公网 HTTPS / WebSocket 的图像、中文语音、有声回复测试，开发板也已实际烧录并上传过至少 118 帧；期间出现 TLS 连接重置，持续上传仍需联调。用户手机截图显示已选择 Enco R4，但耳机实际收音、播报与锁屏续航尚未验收。v0.1.1 修复慢网络下状态请求积压，并增加 App 内网络检查；仍需在 OPPO 手机上确认超时是否解决。模型回答不能作为驾驶、过马路或其他安全判断依据。
+**当前 Android 与 ESP32 固件为 v0.2.0 原型版。** 新增热点内加密 TCP / UDP → 手机 HTTPS 中转，避开 ESP32 的公网 TLS 握手；原始画面过期后主动释放。实物 UDP 测试曾复现发送 `errno=12`，现改为优先 TCP、逐帧等待手机确认，UDP 保留兼容回退。正式签名 APK 已在 OPPO 覆盖安装；真实热点的持续收帧记录见 [验证记录](docs/VALIDATION.md)。此前 L40S 上的图像、中文语音和有声回复公网合成测试已通过。
 
 ## 下载与上手
 
-- [安卓安装包 jarvis-android-v0.1.1.apk](https://github.com/iapetuszzb/esp32-jarvis/releases/download/v0.1.1/jarvis-android-v0.1.1.apk)
-- [ESP32 固件与 Windows 烧录脚本](https://github.com/iapetuszzb/esp32-jarvis/releases/download/v0.1.0/jarvis-esp32s3-firmware.zip)
-- [合并固件，烧录地址 0x0](https://github.com/iapetuszzb/esp32-jarvis/releases/download/v0.1.0/jarvis-esp32s3-merged.bin)
-- [Android 发布页与 SHA256SUMS.txt](https://github.com/iapetuszzb/esp32-jarvis/releases/tag/v0.1.1) · [固件发布页](https://github.com/iapetuszzb/esp32-jarvis/releases/tag/v0.1.0)
+- [安卓安装包 jarvis-android-v0.2.0.apk](https://github.com/iapetuszzb/esp32-jarvis/releases/download/v0.2.0/jarvis-android-v0.2.0.apk)
+- [ESP32 固件与 Windows 烧录脚本](https://github.com/iapetuszzb/esp32-jarvis/releases/download/v0.2.0/jarvis-esp32s3-firmware.zip)
+- [合并固件，首次烧录地址 0x0](https://github.com/iapetuszzb/esp32-jarvis/releases/download/v0.2.0/jarvis-esp32s3-merged.bin)
+- [发布页与 SHA256SUMS.txt](https://github.com/iapetuszzb/esp32-jarvis/releases/tag/v0.2.0) · [热点中转与旧帧释放说明](docs/UDP_RELAY.md)
 - [逐步安装指南](docs/GETTING_STARTED.md) · [服务端部署](docs/DEPLOY.md) · [协议与系统设计](docs/ARCHITECTURE.md) · [构建方法](docs/BUILD.md) · [验证记录](docs/VALIDATION.md)
 
 APK 支持 Android 8.0+，包含离线唤醒模型，安装后首次启动需解压模型。推荐先在 OPPO 手机前台验证，再开启后台权限。连接密钥、配对码、热点密码和 APK 签名私钥均不随源码发布；当前部署的持有人通过私下提供的连接 JSON 导入。
@@ -18,8 +18,8 @@ APK 支持 Android 8.0+，包含离线唤醒模型，安装后首次启动需解
 
 ```mermaid
 flowchart LR
-    CAM[ESP32-S3 + OV5640] -->|2.4 GHz Wi-Fi| HOT[Android 手机热点]
-    HOT -->|HTTPS JPEG 约 1 fps| API[云端 Jarvis API]
+    CAM[ESP32-S3 + OV5640] -->|热点内加密 TCP 优先 / UDP 回退 约 1 fps| RELAY[Android 摄像头中转]
+    RELAY -->|移动数据 HTTPS JPEG| API[云端 Jarvis API]
     EAR[Enco R4 耳机麦克风] -->|蓝牙 HFP| APP[Android App]
     APP -->|本地 Vosk| WAKE[Hey Jarvis 唤醒]
     WAKE -->|开启会话| APP
@@ -28,14 +28,14 @@ flowchart LR
     APP -->|蓝牙通话音频| EAR
 ```
 
-**画面直接经过热点上传服务器，App 不做图像中转。** 热点共享通常允许已连接设备主动访问公网，无需手机端口转发。App 使用移动数据连同一服务器。两者使用相同的设备会话 ID，默认 `jarvis`。ESP32-S3 实际具备 BLE，但本方案不使用它；耳机通话和播放走手机标准蓝牙音频接口，无需逆向 OPPO 私有协议。
+**v0.2.0 默认通过手机中转画面，仍可选择 ESP32 直接 HTTPS 上传。** 中转接收地址为热点网关，手机端需主动开启“摄像头中转”。手机与摄像头使用相同密钥和设备会话 ID，默认 `jarvis`。ESP32-S3 实际具备 BLE，但本方案不使用它；耳机通话和播放走手机标准蓝牙音频接口，无需逆向 OPPO 私有协议。
 
 ## 当前功能
 
-- 摄像头：VGA JPEG 约 1 fps，TLS 证书校验，断线重连，SoftAP 网页/App 配网，BOOT 长按重新配网。
+- 摄像头：VGA JPEG 约 1 fps，热点内 AES-GCM TCP / UDP 中转或证书校验 HTTPS 直传，断线重连，SoftAP 网页/App 配网，BOOT 长按重新配网。
 - 手机：离线 Hey Jarvis，手动开始/结束，HFP 优先路由，明确显示手机麦克风回退，中文文字看图提问和语音播放。
 - 模型：真实全双工图像+音频输入、24 kHz 语音输出；不额外串联 ASR、LLM 和 TTS。单张图文字接口作为调试入口。
-- 服务：单 GPU 会话、最新画面缓存、4 秒过期、音频队列限流、一次性配对码与 Bearer 鉴权。
+- 服务：单 GPU 会话、最新画面缓存、超过 4 秒主动释放像素、音频队列限流、一次性配对码与 Bearer 鉴权。
 - 持续观察：开启后直接进入会话，允许模型主动提醒；它不是可靠事件检测器，也不保证只在你提问时开口。
 
 每轮云端会话最长 10 分钟；普通模式连续约 60 秒未检测到说话会返回唤醒状态，持续观察模式不使用该手机端静音超时。6 小时麦克风唤醒锁到期后需重新开启监听。当前没有自动跨会话记忆、可靠打断播报、自动重连或多用户并发调度。

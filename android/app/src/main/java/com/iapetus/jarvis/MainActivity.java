@@ -23,8 +23,8 @@ import java.util.concurrent.TimeUnit;
 
 public final class MainActivity extends Activity {
     private EditText server,token,session,question,hotspotName,hotspotPassword,pairCode;
-    private Switch proactive;
-    private TextView status,camera,microphone,history;
+    private Switch proactive,relayMode;
+    private TextView status,camera,microphone,history,relayStatus;
     private final Handler ui=new Handler(Looper.getMainLooper());
     private final OkHttpClient http=NetworkClients.requests();
     private final StatusPoller cameraPoll=new StatusPoller(NetworkClients.status());
@@ -34,6 +34,7 @@ public final class MainActivity extends Activity {
     private MediaPlayer reply;
     private final BroadcastReceiver events=new BroadcastReceiver(){
         @Override public void onReceive(Context c,Intent i){
+            if(CameraRelayService.EVENT.equals(i.getAction())){relayStatus.setText(i.getStringExtra("message"));return;}
             status.setText(i.getStringExtra("status"));microphone.setText(i.getStringExtra("mic"));
             String words=i.getStringExtra("text");if(words!=null&&!words.isEmpty())append("Jarvis",words);
         }
@@ -79,7 +80,7 @@ public final class MainActivity extends Activity {
         pairCode=field(connection,"一次性配对码（首次使用，可替代手填访问密钥）","",true);
         button(connection,"使用配对码连接",this::pairServer);
         proactive=new Switch(this);proactive.setText("持续观察：无需每轮唤醒，允许主动提醒");proactive.setChecked(c.proactive);proactive.setPadding(0,dp(8),0,dp(8));connection.addView(proactive);
-        button(connection,"保存并检查连接",()->{if(saveConfig()){stopService(new Intent(this,JarvisService.class));cameraPoll.cancel();checkCamera();}});
+        button(connection,"保存并检查连接",()->{if(saveConfig()){stopService(new Intent(this,JarvisService.class));stopService(new Intent(this,CameraRelayService.class));relayStatus.setText("配置已保存，请重新开启中转");cameraPoll.cancel();checkCamera();}});
         button(connection,"检查服务器网络",this::checkHealth);
         button(connection,"用浏览器检查服务器",()->{
             HttpUrl u=HttpUrl.parse(server.getText().toString().trim());
@@ -89,12 +90,23 @@ public final class MainActivity extends Activity {
         button(connection,"导入连接配置 JSON",()->{Intent i=new Intent(Intent.ACTION_OPEN_DOCUMENT).setType("application/json").addCategory(Intent.CATEGORY_OPENABLE);startActivityForResult(i,20);});
         connection.addView(text("持续观察开启后，点击“开启”或“立即开始”进入会话。首次使用需要麦克风和附近设备权限。",13,Color.DKGRAY));
 
+        LinearLayout relay=card(root,"摄像头中转");
+        relayStatus=text("未开启 · 需要 v0.2.0 固件并开启手机热点",14,Color.DKGRAY);relay.addView(relayStatus);
+        relay.addView(text("ESP32 在热点内传输加密 TCP / UDP，手机只上传最新完整画面。中转可独立运行，无需开启麦克风。",14,Color.DKGRAY));
+        button(relay,"开启摄像头中转",()->{
+            if(!saveConfig())return;
+            try{startForegroundService(new Intent(this,CameraRelayService.class));relayStatus.setText("正在开启中转…");}
+            catch(Exception e){relayStatus.setText("无法开启中转："+e.getClass().getSimpleName());}
+        });
+        button(relay,"停止摄像头中转",()->{stopService(new Intent(this,CameraRelayService.class));relayStatus.setText("摄像头中转已停止");});
+
         LinearLayout chat=card(root,"文字看图提问");question=field(chat,"语音不可用时，也可以直接问", "眼前画面里有什么？",false);
         button(chat,"发送文字问题并播放回答",this::ask);
         history=text("",15,Color.rgb(27,50,78));history.setTextIsSelectable(true);chat.addView(history);
 
         LinearLayout setup=card(root,"摄像头首次配网");
-        setup.addView(text("① 先关闭手机热点，连接 Jarvis-Cam-xxxxxx Wi-Fi，密码 jarvis-setup。\n② 填入你之后准备开启的手机热点名称和密码，写入摄像头。\n③ 离开摄像头 Wi-Fi，开启 2.4 GHz 手机热点。摄像头直接向服务器上传；本 App 不转发视频。",14,Color.DKGRAY));
+        setup.addView(text("① 先关闭手机热点，连接 Jarvis-Cam-xxxxxx Wi-Fi，密码 jarvis-setup。\n② 填入热点名称和密码，选择传输方式后写入摄像头。\n③ 离开摄像头 Wi-Fi，开启 2.4 GHz 手机热点。中转模式还需点击“开启摄像头中转”。",14,Color.DKGRAY));
+        relayMode=new Switch(this);relayMode.setText("摄像头通过手机中转（v0.2.0 固件）");relayMode.setChecked(true);setup.addView(relayMode);
         hotspotName=field(setup,"手机热点名称", "",false);hotspotPassword=field(setup,"手机热点密码", "",true);
         button(setup,"打开手机 Wi-Fi 设置",()->startActivity(new Intent(Settings.ACTION_WIFI_SETTINGS)));
         button(setup,"把连接配置写入摄像头",this::provisionCamera);
@@ -218,7 +230,7 @@ public final class MainActivity extends Activity {
                 if(!info.isSuccessful())throw new IOException("摄像头配网窗口未开启，请按住 BOOT 3 秒");
                 JSONObject json=new JSONObject(info.body().string());
                 FormBody b=new FormBody.Builder().add("setup_code",json.getString("setup_code")).add("ssid",ssid).add("wifi_password",pass)
-                    .add("server",c.server).add("token",c.token).add("session",c.session).build();
+                    .add("server",c.server).add("token",c.token).add("session",c.session).add("transport",relayMode.isChecked()?"udp":"https").build();
                 try(Response r=local.newCall(new Request.Builder().url("http://192.168.4.1/configure").post(b).build()).execute()){
                     if(!r.isSuccessful())throw new IOException("配置保存失败 HTTP "+r.code());
                     ui.post(()->{status.setText("摄像头配置已保存。现在离开摄像头 Wi-Fi，开启 2.4 GHz 手机热点。");hotspotPassword.setText("");});
@@ -239,7 +251,7 @@ public final class MainActivity extends Activity {
             }catch(Exception e){toast("无法导入配置："+e.getMessage());}
         }
     }
-    @Override protected void onStart(){super.onStart();visible=true;IntentFilter f=new IntentFilter(JarvisService.EVENT);androidx.core.content.ContextCompat.registerReceiver(this,events,f,androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED);ui.post(poll);}
+    @Override protected void onStart(){super.onStart();visible=true;IntentFilter f=new IntentFilter(JarvisService.EVENT);f.addAction(CameraRelayService.EVENT);androidx.core.content.ContextCompat.registerReceiver(this,events,f,androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED);ui.post(poll);}
     @Override protected void onStop(){visible=false;ui.removeCallbacks(poll);cameraPoll.cancel();healthPoll.cancel();unregisterReceiver(events);super.onStop();}
     @Override protected void onDestroy(){if(reply!=null){reply.release();reply=null;}super.onDestroy();}
 }
