@@ -46,7 +46,7 @@ Release 附带 `validation-report.json`、`validation-input.jpg` 和 `validation
 ## 2026-10-16 后续实物联调与 Android v0.1.1
 
 - 实际通过 USB 串口完成 ESP32-S3 烧录，写入哈希校验通过。芯片 rev 0.2，物理 Flash 16 MB，内嵌 OPI PSRAM 8 MB；当前固件使用 8 MB 分区布局。原始 Flash 已保存在本地私有目录，不随发布上传。
-- 实际摄像头曾向服务器上传 5 帧，随后串口出现 `start_ssl_client: -80`（`MBEDTLS_ERR_NET_CONN_RESET`）和上传 `status=-1`。这证明摄像头链路曾经连通，不能证明持续上传稳定。
+- 实际摄像头最初向服务器上传 5 帧，随后串口出现 `start_ssl_client: -80`（`MBEDTLS_ERR_NET_CONN_RESET`）和上传 `status=-1`。后续再次查询时累计已收到 118 帧，说明上传曾恢复，但最后画面约 60 秒前，仍处于离线状态。这证明摄像头链路曾经连通，不能证明持续上传稳定。
 - 用户反馈手机使用移动数据并开启热点，手机浏览器访问当前服务器 `/health` 得到 `ready:true`、`busy:false`。截图中 App 显示蓝牙设备 Enco R4，但有网络 timeout；未据此认定耳机录音和播报已通过。
 - Android v0.1.1 将状态查询与文字请求分开调度，限制状态查询同时最多一次并设置 12 秒总超时，增加独立网络检查和明确错误提示；DNS 优先 IPv4，同时保留 IPv6 回退。尚未确认实际手机超时是否由 IPv6 引起。
 - `assembleRelease`、`testReleaseUnitTest`、`lintRelease` 通过：4 项 JVM 测试零失败，Lint 为 0 errors / 8 warnings。新增测试验证慢状态请求不阻塞文字请求、重复轮询被跳过、取消后可重新查询，以及 IPv4 优先但保留 IPv6。
